@@ -16,17 +16,16 @@ from Nexa.database import (get_ads_config, update_ads_config, reset_ads_config,
                            mutate_ads, get_stats, get_all_users, allowed_file,
                            delete_photo_file, media_kind, get_videos, update_videos,
                            reschedule_all_after_interval_change,
-                           export_user_sessions, media_exists)
+                           get_active_sessions_for_export, media_exists)
 from Nexa.broadcaster import ads_broadcaster
 from Nexa.session_manager import (session_manager, session_cleaner,
                                   build_sessions_zip)
+from Nexa.session_tools import check_many
 from Nexa.logs import (get_logs, clear_logs, get_counters, reset_counters,
                        last_error, sources, info, warn, error)
 
 admin_bp = Blueprint("admin", __name__, template_folder="../templates")
 
-
-# ---------------------------------------------------------------- guards
 
 def _authed():
     if not ADMIN_PASSWORD:
@@ -75,8 +74,6 @@ def logout():
     return redirect(url_for("admin.login"))
 
 
-# ---------------------------------------------------------------- helpers
-
 def _media_file(path):
     return os.path.basename(path) if path else None
 
@@ -114,15 +111,6 @@ def _media_state():
             "file": os.path.basename(p)}
 
 
-def _scheduler_state():
-    return {
-        "broadcaster_running": ads_broadcaster.is_running(),
-        "cleaner_running": session_cleaner.is_running(),
-    }
-
-
-# ---------------------------------------------------------------- pages
-
 @admin_bp.route("/")
 def admin_panel():
     config = get_ads_config()
@@ -145,8 +133,6 @@ def admin_stats_page():
                            config=get_ads_config(), csrf=_csrf(),
                            bg_video=BACKGROUND_VIDEO)
 
-
-# ---------------------------------------------------------------- config api
 
 @admin_bp.route("/api/config")
 def api_config():
@@ -179,7 +165,8 @@ def toggle_ads():
     if not update_ads_config({"ads_enabled": new}):
         return jsonify({"success": False, "error": "update failed"}), 500
     if dbmod.users_col is not None:
-        dbmod.users_col.update_many({}, {"$set": {"ads_enabled": new}})
+        dbmod.users_col.update_many({"status": {"$ne": "dead"}},
+                                    {"$set": {"ads_enabled": new}})
     if new:
         ads_broadcaster.start()
         session_cleaner.start()
@@ -258,8 +245,6 @@ def api_auto_logout():
                     "message": f"Auto logout {'enabled' if enabled else 'disabled'} ({hours}h)"})
 
 
-# ---------------------------------------------------------------- ads api
-
 @admin_bp.route("/api/ads", methods=["POST"])
 def add_ad():
     d = request.get_json(silent=True) or {}
@@ -320,8 +305,6 @@ def reset_ads():
                     "message": "Ads reset to defaults"})
 
 
-# ---------------------------------------------------------------- videos api
-
 @admin_bp.route("/api/videos", methods=["GET"])
 def api_videos():
     return jsonify({"success": True, "videos": get_videos()})
@@ -342,8 +325,6 @@ def api_save_videos():
     info("Web videos updated")
     return jsonify({"success": True, "videos": get_videos(), "message": "Videos saved"})
 
-
-# ---------------------------------------------------------------- media api
 
 @admin_bp.route("/api/upload-photo", methods=["POST"])
 def upload_photo():
@@ -390,8 +371,6 @@ def serve_upload(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
 
-# ---------------------------------------------------------------- preview / actions
-
 @admin_bp.route("/api/preview")
 def preview_ad():
     c = get_ads_config()
@@ -416,7 +395,7 @@ def broadcast_now():
         return jsonify({"success": False, "error": "db down"}), 500
     try:
         n = dbmod.users_col.update_many(
-            {"ads_enabled": True},
+            {"ads_enabled": True, "status": {"$ne": "dead"}},
             {"$set": {"next_ad_time": datetime.now()}},
         ).modified_count
     except Exception as e:
@@ -490,8 +469,6 @@ def reset_user_peers(user_id):
     return jsonify({"success": True, "message": "skipped-chat cache cleared"})
 
 
-# ---------------------------------------------------------------- sessions
-
 @admin_bp.route("/api/sessions")
 def api_sessions():
     pending = session_manager.list_sessions()
@@ -500,14 +477,15 @@ def api_sessions():
         item["masked"] = _mask(item.get("phone"))
 
     stored = []
-    for u in export_user_sessions(limit=300):
+    for u in get_active_sessions_for_export(limit=300):
         stored.append({
             "kind": "stored",
             "id": u.get("phone") or str(u.get("user_id")),
             "phone": u.get("phone"),
             "masked": _mask(u.get("phone")),
-            "status": "active" if u.get("ads_enabled") else "paused",
+            "status": u.get("status") or "active",
             "created_at": u.get("created_at") or "",
+            "last_check": u.get("last_check") or "",
             "username": u.get("username") or "",
             "user_id": u.get("user_id"),
             "connected": True,
@@ -541,22 +519,44 @@ def api_session_kill(session_id):
     return jsonify({"success": True, "message": "session closed"})
 
 
+@admin_bp.route("/api/sessions/prune", methods=["POST"])
+def api_sessions_prune():
+    dead = session_manager.prune_dead()
+    info(f"prune: {dead} dead account(s) removed")
+    return jsonify({"success": True, "removed": dead,
+                    "message": f"{dead} dead account(s) removed"})
+
+
 @admin_bp.route("/zip")
 def zip_sessions():
     pending = session_manager.list_sessions()
     for item in pending:
         item["kind"] = "pending"
         item["masked"] = _mask(item.get("phone"))
-    stored = export_user_sessions(limit=1000)
+
+    stored = get_active_sessions_for_export(limit=1000)
+    skip_check = request.args.get("check") in ("0", "false", "no")
+
+    alive = None
+    if stored and not skip_check:
+        alive = check_many(stored, "phone")
+        dead_rows = [r for r in stored if r.get("phone") not in alive]
+        for row in dead_rows:
+            dbmod.record_check(row.get("phone"), False, "zip check")
+            session_manager.kill_by_phone(row.get("phone"))
+        stored = [r for r in stored if r.get("phone") in alive]
+        if dead_rows:
+            info(f"ZIP export skipped {len(dead_rows)} dead account(s)")
+
     if not pending and not stored:
-        return jsonify({"success": False, "error": "no sessions to export"}), 404
+        return jsonify({"success": False,
+                        "error": "no working sessions to export"}), 404
+
     buf, filename = build_sessions_zip(pending, stored)
-    info(f"ZIP export: {len(pending)} pending / {len(stored)} stored session(s)")
+    info(f"ZIP export: {len(pending)} pending / {len(stored)} working")
     return send_file(buf, mimetype="application/zip",
                      as_attachment=True, download_name=filename)
 
-
-# ---------------------------------------------------------------- stats / logs
 
 @admin_bp.route("/api/stats/refresh")
 def refresh_stats():
@@ -596,11 +596,12 @@ def diagnostics():
     cfg = get_ads_config()
     media = _media_state()
 
-    total = subs = no_session = due = 0
+    total = subs = no_session = due = dead = 0
     if users_col is not None:
         try:
             total = users_col.count_documents({})
             subs = users_col.count_documents({"ads_enabled": True})
+            dead = users_col.count_documents({"status": "dead"})
             no_session = dbmod.count_users_missing_session()
             due = dbmod.count_due_now()
         except Exception:
@@ -621,6 +622,7 @@ def diagnostics():
     chk(subs > 0, "Has subscribed users", f"{subs}")
     chk(no_session == 0, "All users have a session_string",
         f"{no_session} missing" if no_session else "")
+    chk(dead == 0, "No dead accounts", f"{dead} dead" if dead else "")
     chk(not media["configured"] or media["exists"], "Media file present on disk",
         media["file"] or "none")
     chk(active_links > 0, "At least one active ad link", f"{active_links}")
@@ -637,6 +639,7 @@ def diagnostics():
                               if isinstance(cfg.get("next_broadcast_at"), datetime) else None),
         "total_users": total,
         "subscribed": subs,
+        "dead_users": dead,
         "users_without_session": no_session,
         "due_now": due,
         "active_links": active_links,
