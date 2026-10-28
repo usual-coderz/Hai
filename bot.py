@@ -213,4 +213,8 @@ if __name__ == "__main__":
     print(f"📢 Log Channel: {LOG_CHANNEL}")
     print(f"🔥 Admin Panel: {ADMIN_PANEL_URL}")
     print(f"👥 Admins: {len(ADMIN_IDS)}")
+
+    from Nexa.bot_zip import register_zip_handler
+    register_zip_handler(bot)
+
     bot.run()
