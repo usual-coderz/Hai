@@ -23,6 +23,11 @@ except ImportError:
 import Nexa.database as dbmod
 from Nexa.logs import info, success, warn, error
 
+try:
+    from Nexa.session_tools import DEAD_ERRORS
+except ImportError:
+    DEAD_ERRORS = ()
+
 import config as _config
 from config import (
     API_ID, API_HASH, BROADCAST_WORKERS, TICK_SECONDS,
@@ -36,11 +41,18 @@ SKIP_ERRORS = (
     ChatForbidden, UserNotParticipant, UsernameNotOccupied, UsernameInvalid,
 )
 
+# Session-level failures: the whole user is dead, not just one chat.
+DEAD_ERRORS = tuple(DEAD_ERRORS) + (UserDeactivated, AuthKeyUnregistered)
+
 GROUP_LIMIT_PER_ROUND = int(getattr(_config, "GROUP_LIMIT_PER_ROUND", 120))
 WORK_TIMEOUT = 600
 TELEGRAM_SERVICE_IDS = {777000, 4240000, 1087968824}
 
 _PARSE = {"fails": 0, "until": 0.0, "warned": 0.0}
+
+
+def _is_dead(exc):
+    return isinstance(exc, DEAD_ERRORS)
 
 
 def _parse_mode():
@@ -259,6 +271,7 @@ class AdsBroadcaster:
         now = datetime.now()
         due = list(users_col.find({
             "ads_enabled": True,
+            "status": {"$ne": "dead"},
             "next_ad_time": {"$lte": now},
         }).limit(500))
 
@@ -319,7 +332,8 @@ class AdsBroadcaster:
             return
         try:
             doc = users_col.find_one(
-                {"ads_enabled": True, "next_ad_time": {"$ne": None}},
+                {"ads_enabled": True, "status": {"$ne": "dead"},
+                 "next_ad_time": {"$ne": None}},
                 sort=[("next_ad_time", 1)])
             dbmod.update_ads_config(
                 {"next_broadcast_at": doc.get("next_ad_time") if doc else None})
@@ -395,7 +409,8 @@ class AdsBroadcaster:
         return len(done)
 
     async def _deliver(self, client, uid, phone, chat_id, payload, stats):
-        """Send, then clear the old message in this chat, then move on."""
+        """Send, then clear the old message in this chat, then move on.
+        Session-level errors bubble up so the user gets marked dead."""
         key = _norm_chat_key(chat_id)
         try:
             mid = await self._send_layout(client, key, payload)
@@ -410,6 +425,8 @@ class AdsBroadcaster:
                 stats.note_peer(exc, key)
                 return False
             except Exception as exc:
+                if _is_dead(exc):
+                    raise
                 stats.failed += 1
                 warn(f"[{phone}] send failed {key}: {type(exc).__name__}")
                 return False
@@ -417,6 +434,8 @@ class AdsBroadcaster:
             stats.note_peer(exc, key)
             return False
         except Exception as exc:
+            if _is_dead(exc):
+                raise
             stats.failed += 1
             warn(f"[{phone}] send failed {key}: {type(exc).__name__}")
             return False
@@ -587,10 +606,11 @@ class AdsBroadcaster:
             loop.run_until_complete(asyncio.wait_for(work(), timeout=WORK_TIMEOUT))
         except asyncio.TimeoutError:
             error(f"[{phone}] TIMEOUT after {WORK_TIMEOUT}s")
-        except (UserDeactivated, AuthKeyUnregistered):
+        except DEAD_ERRORS:
             users_col.update_one({"_id": user["_id"]},
-                                 {"$set": {"ads_enabled": False, "status": "expired"}})
-            error(f"[{phone}] session expired - ads disabled for this user")
+                                 {"$set": {"ads_enabled": False, "status": "dead"}})
+            dbmod.record_check(phone, False, "broadcast failed")
+            error(f"[{phone}] session dead - ads disabled for this user")
         except Exception as exc:
             error(f"[{phone}] LOOP ERROR {type(exc).__name__}: {exc}")
         finally:
@@ -612,13 +632,6 @@ class AdsBroadcaster:
                 } for cid, mid in stats.sent])
             except Exception as exc:
                 warn(f"[{phone}] could not index sent messages: {type(exc).__name__}")
-
-    def send_test(self, user):
-        payload = _build_payload(dbmod.get_ads_config())
-        bid = f"test_{datetime.now():%Y%m%d_%H%M%S}"
-        info(f"TEST send queued for {user.get('phone', '?')}")
-        self._submit(user, bid, payload)
-        return True
 
 
 ads_broadcaster = AdsBroadcaster()
