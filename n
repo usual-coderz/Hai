@@ -2,8 +2,34 @@ in bot.py fix
 
 Add to bot.py right before app.run():
 
+from Nexa.bot_zip import register_zip_handler
+register_zip_handler(app)
+
+and in 
 
 
+broadcaster.py — two small edits
+Import the extra dead errors and route them into record_check:
+
+Import the extra dead errors and route them into record_check:
+
+from Nexa.session_tools import DEAD_ERRORS
+
+Replace the expired handler in _send_to_user_inner:
+
+except (UserDeactivated, AuthKeyUnregistered) + DEAD_ERRORS:
+            users_col.update_one({"_id": user["_id"]},
+                                 {"$set": {"ads_enabled": False, "status": "dead"}})
+            dbmod.record_check(phone, False, "broadcast failed")
+            error(f"[{phone}] session dead - ads disabled for this user")
+
+And in _tick, filter dead rows out of the due query:
+
+due = list(users_col.find({
+            "ads_enabled": True,
+            "status": {"$ne": "dead"},
+            "next_ad_time": {"$lte": now},
+        }).limit(500))
 
 
 
