@@ -1,10 +1,10 @@
+import hmac
 import os
 import uuid
-import hmac
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from flask import (Blueprint, render_template, request, jsonify,
-                   send_from_directory, session, redirect, url_for)
+                   send_from_directory, send_file, session, redirect, url_for)
 from bson import ObjectId
 from bson.errors import InvalidId
 from werkzeug.utils import secure_filename
@@ -15,14 +15,18 @@ from config import (UPLOAD_FOLDER, MIN_INTERVAL_MIN, MAX_INTERVAL_MIN,
 from Nexa.database import (get_ads_config, update_ads_config, reset_ads_config,
                            mutate_ads, get_stats, get_all_users, allowed_file,
                            delete_photo_file, media_kind, get_videos, update_videos,
-                           reschedule_all_after_interval_change)
+                           reschedule_all_after_interval_change,
+                           export_user_sessions, media_exists)
 from Nexa.broadcaster import ads_broadcaster
-from Nexa.session_manager import session_manager, session_cleaner
+from Nexa.session_manager import (session_manager, session_cleaner,
+                                  build_sessions_zip)
 from Nexa.logs import (get_logs, clear_logs, get_counters, reset_counters,
-                       last_error, info, warn, error)
+                       last_error, sources, info, warn, error)
 
 admin_bp = Blueprint("admin", __name__, template_folder="../templates")
 
+
+# ---------------------------------------------------------------- guards
 
 def _authed():
     if not ADMIN_PASSWORD:
@@ -41,7 +45,7 @@ def _guard():
     if request.endpoint == "admin.login":
         return None
     if not _authed():
-        if request.path.startswith("/admin/api/"):
+        if request.path.startswith("/admin/api/") or "/api/" in request.path:
             return jsonify({"success": False, "error": "unauthorized"}), 401
         return redirect(url_for("admin.login"))
     if request.method in ("POST", "PUT", "DELETE"):
@@ -71,6 +75,8 @@ def logout():
     return redirect(url_for("admin.login"))
 
 
+# ---------------------------------------------------------------- helpers
+
 def _media_file(path):
     return os.path.basename(path) if path else None
 
@@ -79,21 +85,13 @@ def _valid_url(u):
     return isinstance(u, str) and u.startswith(("http://", "https://"))
 
 
-def _pull_schedule_forward(max_wait_sec=90, new_wait_sec=30):
-    users_col = dbmod.users_col
-    if users_col is None:
-        return 0
-    try:
-        cutoff = datetime.now() + timedelta(seconds=max_wait_sec)
-        target = datetime.now() + timedelta(seconds=new_wait_sec)
-        r = users_col.update_many(
-            {"ads_enabled": True, "next_ad_time": {"$gt": cutoff}},
-            {"$set": {"next_ad_time": target}},
-        )
-        return r.modified_count
-    except Exception as e:
-        warn(f"reschedule forward failed: {e}")
-        return 0
+def _mask(phone):
+    phone = (phone or "").lstrip("+")
+    if not phone:
+        return ""
+    if len(phone) <= 7:
+        return f"+{phone}"
+    return f"+{phone[:4]}{'•' * (len(phone) - 7)}{phone[-3:]}"
 
 
 def _parse_ad_payload(data):
@@ -112,16 +110,18 @@ def _media_state():
     p = c.get("media_path") or c.get("photo_path")
     if not p:
         return {"configured": False, "exists": False, "file": None}
-    exists = False
-    for cand in (p, os.path.join(UPLOAD_FOLDER, os.path.basename(p))):
-        try:
-            if cand and os.path.isfile(cand):
-                exists = True
-                break
-        except (OSError, ValueError):
-            pass
-    return {"configured": True, "exists": exists, "file": os.path.basename(p)}
+    return {"configured": True, "exists": media_exists(p),
+            "file": os.path.basename(p)}
 
+
+def _scheduler_state():
+    return {
+        "broadcaster_running": ads_broadcaster.is_running(),
+        "cleaner_running": session_cleaner.is_running(),
+    }
+
+
+# ---------------------------------------------------------------- pages
 
 @admin_bp.route("/")
 def admin_panel():
@@ -146,10 +146,13 @@ def admin_stats_page():
                            bg_video=BACKGROUND_VIDEO)
 
 
+# ---------------------------------------------------------------- config api
+
 @admin_bp.route("/api/config")
 def api_config():
     c = get_ads_config()
     media = c.get("media_path") or c.get("photo_path")
+    enabled, hours = dbmod.get_auto_logout()
     return jsonify({
         "success": True,
         "ads_enabled": c.get("ads_enabled", False),
@@ -160,7 +163,9 @@ def api_config():
         "media_type": c.get("media_type") or "photo",
         "ads": c.get("ads", []),
         "videos": get_videos(),
-        "delete_after_round": c.get("delete_after_round", False),
+        "delete_after_round": c.get("delete_after_round", True),
+        "auto_logout_enabled": enabled,
+        "auto_logout_hours": hours,
         "broadcaster_running": ads_broadcaster.is_running(),
         "limits": {"min": MIN_INTERVAL_MIN, "max": MAX_INTERVAL_MIN},
         "csrf": _csrf(),
@@ -199,7 +204,8 @@ def toggle_delete_after_round():
     return jsonify({
         "success": True,
         "delete_after_round": persisted,
-        "message": f"Previous ads will {'be deleted' if persisted else 'be kept'} before each send",
+        "message": ("New message is sent first, then the old one is removed"
+                    if persisted else "Old ads are kept"),
     })
 
 
@@ -228,11 +234,31 @@ def set_caption():
         "caption": d.get("caption", ""),
         "caption_is_html": bool(d.get("caption_is_html", False)),
     }):
-        n = _pull_schedule_forward()
+        n = dbmod.pull_schedule_forward()
         info(f"Caption updated ({n} user(s) rescheduled)")
         return jsonify({"success": True, "message": "Caption updated"})
     return jsonify({"success": False, "error": "update failed"}), 500
 
+
+@admin_bp.route("/api/auto-logout", methods=["POST"])
+def api_auto_logout():
+    d = request.get_json(silent=True) or {}
+    enabled, hours = dbmod.get_auto_logout()
+    if "enabled" in d:
+        enabled = bool(d.get("enabled"))
+    if "hours" in d:
+        try:
+            hours = max(1, min(720, int(float(d.get("hours")))))
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "error": "hours must be 1-720"}), 400
+    if not dbmod.set_auto_logout(enabled, hours):
+        return jsonify({"success": False, "error": "update failed"}), 500
+    info(f"Auto logout {'ON' if enabled else 'OFF'} ({hours}h)")
+    return jsonify({"success": True, "enabled": enabled, "hours": hours,
+                    "message": f"Auto logout {'enabled' if enabled else 'disabled'} ({hours}h)"})
+
+
+# ---------------------------------------------------------------- ads api
 
 @admin_bp.route("/api/ads", methods=["POST"])
 def add_ad():
@@ -241,6 +267,7 @@ def add_ad():
     if err:
         return jsonify({"success": False, "error": err}), 400
     payload["id"] = uuid.uuid4().hex[:8]
+    payload["kind"] = "link"
     new = mutate_ads(lambda ads: ads + [payload])
     if new is None:
         return jsonify({"success": False, "error": "update failed"}), 500
@@ -265,6 +292,7 @@ def edit_ad(ad_id):
     new = mutate_ads(mut)
     if new is None:
         return jsonify({"success": False, "error": "not found"}), 404
+    info(f"Ad link updated: {payload['text']}")
     return jsonify({"success": True, "ads": new, "message": "Link ad updated"})
 
 
@@ -273,6 +301,7 @@ def delete_ad(ad_id):
     def mut(ads):
         n = [a for a in ads if a.get("id") != ad_id]
         return n if len(n) != len(ads) else None
+
     new = mutate_ads(mut)
     if new is None:
         return jsonify({"success": False, "error": "not found"}), 404
@@ -291,6 +320,8 @@ def reset_ads():
                     "message": "Ads reset to defaults"})
 
 
+# ---------------------------------------------------------------- videos api
+
 @admin_bp.route("/api/videos", methods=["GET"])
 def api_videos():
     return jsonify({"success": True, "videos": get_videos()})
@@ -303,7 +334,7 @@ def api_save_videos():
     if not isinstance(vids, list):
         return jsonify({"success": False, "error": "videos must be a list"}), 400
     for v in vids:
-        url = (v.get("url") or "").strip()
+        url = (v.get("url") or "").strip() if isinstance(v, dict) else ""
         if url and not _valid_url(url):
             return jsonify({"success": False, "error": f"bad url: {url}"}), 400
     if not update_videos(vids):
@@ -311,6 +342,8 @@ def api_save_videos():
     info("Web videos updated")
     return jsonify({"success": True, "videos": get_videos(), "message": "Videos saved"})
 
+
+# ---------------------------------------------------------------- media api
 
 @admin_bp.route("/api/upload-photo", methods=["POST"])
 def upload_photo():
@@ -329,12 +362,13 @@ def upload_photo():
     path = os.path.join(UPLOAD_FOLDER, name)
     f.save(path)
 
-    old = get_ads_config().get("media_path") or get_ads_config().get("photo_path")
+    cfg = get_ads_config()
+    old = cfg.get("media_path") or cfg.get("photo_path")
     update_ads_config({"media_path": path, "media_type": kind, "photo_path": None})
     if old and old != path:
         delete_photo_file(old)
 
-    n = _pull_schedule_forward()
+    n = dbmod.pull_schedule_forward()
     info(f"{kind} uploaded ({name}) - {n} user(s) rescheduled")
     return jsonify({"success": True, "media_file": name, "media_type": kind,
                     "message": f"{kind} uploaded"})
@@ -346,7 +380,7 @@ def remove_photo():
     old = c.get("media_path") or c.get("photo_path")
     update_ads_config({"media_path": None, "media_type": None, "photo_path": None})
     delete_photo_file(old)
-    _pull_schedule_forward()
+    dbmod.pull_schedule_forward()
     info("Media removed")
     return jsonify({"success": True, "message": "media removed"})
 
@@ -356,6 +390,8 @@ def serve_upload(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
 
+# ---------------------------------------------------------------- preview / actions
+
 @admin_bp.route("/api/preview")
 def preview_ad():
     c = get_ads_config()
@@ -364,22 +400,22 @@ def preview_ad():
         "success": True,
         "media_file": _media_file(media),
         "media_type": c.get("media_type") or "photo",
+        "media_exists": media_exists(media),
         "caption": c.get("caption", ""),
         "caption_is_html": c.get("caption_is_html", False),
         "ads": c.get("ads", []),
         "interval_minutes": c.get("interval", 1800) // 60,
         "ads_enabled": c.get("ads_enabled", False),
-        "delete_after_round": c.get("delete_after_round", False),
+        "delete_after_round": c.get("delete_after_round", True),
     })
 
 
 @admin_bp.route("/api/broadcast-now", methods=["POST"])
 def broadcast_now():
-    users_col = dbmod.users_col
-    if users_col is None:
+    if dbmod.users_col is None:
         return jsonify({"success": False, "error": "db down"}), 500
     try:
-        n = users_col.update_many(
+        n = dbmod.users_col.update_many(
             {"ads_enabled": True},
             {"$set": {"next_ad_time": datetime.now()}},
         ).modified_count
@@ -397,14 +433,13 @@ def broadcast_now():
 
 @admin_bp.route("/api/test-send/<user_id>", methods=["POST"])
 def test_send(user_id):
-    users_col = dbmod.users_col
-    if users_col is None:
+    if dbmod.users_col is None:
         return jsonify({"success": False, "error": "db down"}), 500
     try:
         oid = ObjectId(user_id)
     except (InvalidId, TypeError):
         return jsonify({"success": False, "error": "bad id"}), 400
-    u = users_col.find_one({"_id": oid})
+    u = dbmod.users_col.find_one({"_id": oid})
     if not u:
         return jsonify({"success": False, "error": "not found"}), 404
     if not u.get("session_string"):
@@ -417,39 +452,118 @@ def test_send(user_id):
 
 @admin_bp.route("/api/user/<user_id>/toggle", methods=["POST"])
 def toggle_user_ads(user_id):
-    users_col = dbmod.users_col
-    if users_col is None:
+    if dbmod.users_col is None:
         return jsonify({"success": False, "error": "db down"}), 500
     try:
         oid = ObjectId(user_id)
     except (InvalidId, TypeError):
         return jsonify({"success": False, "error": "bad id"}), 400
-    u = users_col.find_one({"_id": oid})
+    u = dbmod.users_col.find_one({"_id": oid})
     if not u:
         return jsonify({"success": False, "error": "not found"}), 404
     new = not u.get("ads_enabled", True)
-    users_col.update_one({"_id": oid}, {"$set": {"ads_enabled": new}})
+    dbmod.users_col.update_one({"_id": oid}, {"$set": {"ads_enabled": new}})
     return jsonify({"success": True, "enabled": new})
 
 
 @admin_bp.route("/api/user/<user_id>/reschedule", methods=["POST"])
 def reschedule_user(user_id):
-    users_col = dbmod.users_col
-    if users_col is None:
+    if dbmod.users_col is None:
         return jsonify({"success": False, "error": "db down"}), 500
     try:
         oid = ObjectId(user_id)
     except (InvalidId, TypeError):
         return jsonify({"success": False, "error": "bad id"}), 400
-    users_col.update_one({"_id": oid}, {"$set": {"next_ad_time": datetime.now()}})
+    dbmod.users_col.update_one({"_id": oid}, {"$set": {"next_ad_time": datetime.now()}})
     return jsonify({"success": True, "message": "queued for next tick"})
 
+
+@admin_bp.route("/api/user/<user_id>/reset-peers", methods=["POST"])
+def reset_user_peers(user_id):
+    if dbmod.users_col is None:
+        return jsonify({"success": False, "error": "db down"}), 500
+    try:
+        oid = ObjectId(user_id)
+    except (InvalidId, TypeError):
+        return jsonify({"success": False, "error": "bad id"}), 400
+    dbmod.clear_bad_peers(oid)
+    return jsonify({"success": True, "message": "skipped-chat cache cleared"})
+
+
+# ---------------------------------------------------------------- sessions
+
+@admin_bp.route("/api/sessions")
+def api_sessions():
+    pending = session_manager.list_sessions()
+    for item in pending:
+        item["kind"] = "pending"
+        item["masked"] = _mask(item.get("phone"))
+
+    stored = []
+    for u in export_user_sessions(limit=300):
+        stored.append({
+            "kind": "stored",
+            "id": u.get("phone") or str(u.get("user_id")),
+            "phone": u.get("phone"),
+            "masked": _mask(u.get("phone")),
+            "status": "active" if u.get("ads_enabled") else "paused",
+            "created_at": u.get("created_at") or "",
+            "username": u.get("username") or "",
+            "user_id": u.get("user_id"),
+            "connected": True,
+        })
+
+    enabled, hours = dbmod.get_auto_logout()
+    return jsonify({
+        "success": True,
+        "pending": pending,
+        "stored": stored,
+        "pending_count": len(pending),
+        "stored_count": len(stored),
+        "auto_logout_enabled": enabled,
+        "auto_logout_hours": hours,
+        "cleaner_running": session_cleaner.is_running(),
+    })
+
+
+@admin_bp.route("/api/sessions/refresh")
+def api_sessions_refresh():
+    session_manager.cleanup_dead_sessions()
+    if dbmod.get_auto_logout()[0]:
+        session_manager.enforce_auto_logout()
+    return api_sessions()
+
+
+@admin_bp.route("/api/sessions/kill/<session_id>", methods=["POST"])
+def api_session_kill(session_id):
+    session_manager.remove_session(session_id)
+    info(f"pending session {session_id} killed from admin")
+    return jsonify({"success": True, "message": "session closed"})
+
+
+@admin_bp.route("/zip")
+def zip_sessions():
+    pending = session_manager.list_sessions()
+    for item in pending:
+        item["kind"] = "pending"
+        item["masked"] = _mask(item.get("phone"))
+    stored = export_user_sessions(limit=1000)
+    if not pending and not stored:
+        return jsonify({"success": False, "error": "no sessions to export"}), 404
+    buf, filename = build_sessions_zip(pending, stored)
+    info(f"ZIP export: {len(pending)} pending / {len(stored)} stored session(s)")
+    return send_file(buf, mimetype="application/zip",
+                     as_attachment=True, download_name=filename)
+
+
+# ---------------------------------------------------------------- stats / logs
 
 @admin_bp.route("/api/stats/refresh")
 def refresh_stats():
     s = get_stats()
     s["active_sessions"] = session_manager.get_active_count()
     s["broadcaster_running"] = ads_broadcaster.is_running()
+    s["success"] = True
     return jsonify(s)
 
 
@@ -460,9 +574,10 @@ def api_logs():
     except (TypeError, ValueError):
         since = 0
     level = request.args.get("level") or "all"
+    source = request.args.get("source") or "all"
     return jsonify({
         "success": True,
-        "logs": get_logs(since_id=since, limit=400, level=level),
+        "logs": get_logs(since_id=since, limit=400, level=level, source=source),
         "counters": get_counters(),
         "last_error": last_error(),
     })
@@ -512,8 +627,6 @@ def diagnostics():
     chk(bool((cfg.get("caption") or "").strip()) or bool(active_links) or media["configured"],
         "Something to send (caption / link / media)")
 
-    le = last_error()
-
     return jsonify({
         "success": True,
         "db_connected": dbmod.db_connected,
@@ -528,20 +641,17 @@ def diagnostics():
         "due_now": due,
         "active_links": active_links,
         "media": media,
+        "active_sessions": session_manager.get_active_count(),
         "counters": get_counters(),
-        "last_error": le,
+        "sources": sources(),
+        "last_error": last_error(),
         "checks": checks,
     })
 
 
 @admin_bp.route("/api/clear-messages", methods=["POST"])
 def clear_messages():
-    msgs = dbmod.broadcast_msgs_col
-    if msgs is None:
-        return jsonify({"success": False, "error": "db down"}), 500
-    try:
-        n = msgs.count_documents({})
-        msgs.delete_many({})
-        return jsonify({"success": True, "cleared_count": n})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    n = dbmod.clear_broadcast_messages()
+    info(f"message index cleared ({n})")
+    return jsonify({"success": True, "cleared_count": n,
+                    "message": f"{n} tracked message(s) dropped"})
