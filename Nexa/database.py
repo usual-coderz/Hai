@@ -35,9 +35,10 @@ _PING_INTERVAL = 30
 
 ALLOWED_IMAGE_EXT = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
 ALLOWED_VIDEO_EXT = {"mp4", "mov", "avi", "mkv", "webm", "m4v", "3gp"}
-ALLOWED_EXT       = ALLOWED_IMAGE_EXT | ALLOWED_VIDEO_EXT
+ALLOWED_EXT = ALLOWED_IMAGE_EXT | ALLOWED_VIDEO_EXT
 
 VIDEO_SLOTS = 5
+BAD_PEER_CAP = 300
 
 DEFAULT_ADS = [
     {"id": "ad1", "kind": "link", "text": "Adult Content Available",
@@ -57,6 +58,8 @@ _CFG_DEFAULTS = {
     "media_type": None,
     "photo_path": None,
     "delete_after_round": True,
+    "auto_logout_enabled": False,
+    "auto_logout_hours": 24,
     "next_broadcast_at": None,
     "total_broadcasts": 0,
     "last_broadcast_at": None,
@@ -92,9 +95,7 @@ def _default_config():
 
 
 def _normalize_ad(ad):
-    """Migrate every historical ad shape into the current one.
-    New ads are text links; old inline-button ads keep kind='button' so the
-    admin panel can offer a one-click conversion."""
+    """Migrate every historical ad shape into the current text-link shape."""
     ad = dict(ad or {})
     if not ad.get("id"):
         ad["id"] = uuid.uuid4().hex[:8]
@@ -110,7 +111,6 @@ def _normalize_ad(ad):
         ad["label"] = ad.get("label") or ad.get("text") or ""
         return ad
 
-    # legacy shapes: {has_button, label, url}
     if ad.get("has_button"):
         return {"id": ad["id"], "kind": "button",
                 "label": ad.get("label", ""), "url": ad.get("url", ""),
@@ -121,9 +121,7 @@ def _normalize_ad(ad):
 
 
 def _ensure_indexes():
-    """Create indexes. Never raises - a bad index must not kill a live
-    connection (this used to catch only PyMongoError, so an AttributeError on
-    a not-yet-bound collection tore down the whole client)."""
+    """Never raises - a bad index must not tear down a live connection."""
     try:
         if users_col is not None:
             users_col.create_index([("phone", ASCENDING)])
@@ -138,12 +136,13 @@ def _ensure_indexes():
         if broadcast_msgs_col is not None:
             broadcast_msgs_col.create_index([("broadcast_id", ASCENDING)])
             broadcast_msgs_col.create_index([("user_id", ASCENDING)])
+            broadcast_msgs_col.create_index([("user_id", ASCENDING),
+                                             ("chat_id", ASCENDING)])
     except Exception as exc:
         warn(f"index creation failed: {type(exc).__name__}: {exc}", source="db")
 
 
 def _bind(database):
-    """Bind every collection handle from a live database object."""
     global users_col, ads_config_col, temp_sessions_col, ads_logs_col, broadcast_msgs_col
     users_col = database.users
     ads_config_col = database.ads_config
@@ -202,7 +201,7 @@ def _connect():
             _last_ping = time.time()
 
             info("MongoDB connected", source="db")
-            _ensure_indexes()          # cannot raise now
+            _ensure_indexes()
             return True
 
         except Exception as exc:
@@ -313,11 +312,16 @@ def media_exists(path):
 
 
 def delete_photo_file(path):
-    try:
-        if path and os.path.isfile(path):
-            os.remove(path)
-    except OSError as exc:
-        warn(f"could not delete {path}: {exc}", source="db")
+    """Delete the media file at every plausible location."""
+    if not path or not isinstance(path, str):
+        return
+    base = os.path.basename(path)
+    for cand in {path, os.path.join(UPLOAD_FOLDER, base)}:
+        try:
+            if cand and os.path.isfile(cand):
+                os.remove(cand)
+        except OSError as exc:
+            warn(f"could not delete {cand}: {exc}", source="db")
 
 
 def escape_text(value):
@@ -367,6 +371,8 @@ def save_session_to_db(session_data):
             "deliveries": 0,
             "failures": 0,
             "contact_offset": 0,
+            "dm_offset": 0,
+            "bad_peers": [],
         })
         result = users_col.insert_one(payload)
         info(f"new session stored for {phone} "
@@ -384,14 +390,11 @@ def backfill_next_ad_time():
         return 0
     try:
         r = users_col.update_many(
-            {"next_ad_time": {"$in": [None]}, "$or": [{"next_ad_time": {"$exists": False}}]},
+            {"$or": [{"next_ad_time": {"$exists": False}},
+                     {"next_ad_time": None}]},
             {"$set": {"next_ad_time": datetime.now()}},
         )
-        r2 = users_col.update_many(
-            {"next_ad_time": None},
-            {"$set": {"next_ad_time": datetime.now()}},
-        )
-        return r.modified_count + r2.modified_count
+        return r.modified_count
     except PyMongoError as exc:
         warn(f"backfill failed: {exc}", source="db")
         return 0
@@ -406,9 +409,8 @@ def reschedule_all_after_interval_change(interval_sec):
             {"next_ad_time": {"$gt": cap}},
             {"$set": {"next_ad_time": cap}},
         )
-        # users with no schedule at all should also respect the new cap
         r2 = users_col.update_many(
-            {"next_ad_time": None},
+            {"$or": [{"next_ad_time": None}, {"next_ad_time": {"$exists": False}}]},
             {"$set": {"next_ad_time": cap}},
         )
         return r.modified_count + r2.modified_count
@@ -501,6 +503,34 @@ def mark_user_expired(oid):
         return False
 
 
+def add_bad_peers(oid, chat_ids):
+    """Remember chats that fail with a permanent peer error so later rounds
+    skip them instead of hammering Telegram."""
+    if not chat_ids or not ensure_db() or users_col is None:
+        return 0
+    clean = [c for c in chat_ids if isinstance(c, (int, str))]
+    if not clean:
+        return 0
+    try:
+        users_col.update_one(
+            {"_id": oid},
+            {"$push": {"bad_peers": {"$each": clean, "$slice": -BAD_PEER_CAP}}},
+        )
+        return len(clean)
+    except PyMongoError:
+        return 0
+
+
+def clear_bad_peers(oid):
+    if not ensure_db() or users_col is None:
+        return False
+    try:
+        users_col.update_one({"_id": oid}, {"$set": {"bad_peers": []}})
+        return True
+    except PyMongoError:
+        return False
+
+
 # ---------------------------------------------------------------- counters
 
 def count_users():
@@ -544,25 +574,17 @@ def count_pending_messages():
 
 # ---------------------------------------------------------------- config
 
-def _new_config_doc():
-    doc = {
-        "updated_at": datetime.now(),
-        "ads": [dict(ad) for ad in DEFAULT_ADS],
-        "videos": [dict(v) for v in DEFAULT_VIDEOS],
-    }
-    doc.update(_CFG_DEFAULTS)
-    return doc
-
-
 def get_ads_config():
     if not ensure_db() or ads_config_col is None:
         return _default_config()
     try:
         # Atomic create-and-return: no read-then-write race, and _id stays out
         # of $setOnInsert so there is no field conflict.
+        doc = _default_config()
+        doc.pop("_id", None)
         config = ads_config_col.find_one_and_update(
             {"_id": "main_config"},
-            {"$setOnInsert": _new_config_doc()},
+            {"$setOnInsert": doc},
             upsert=True,
             return_document=ReturnDocument.AFTER,
         )
@@ -576,10 +598,15 @@ def get_ads_config():
         config["ads_enabled"] = _as_bool(config.get("ads_enabled"), False)
         config["caption_is_html"] = _as_bool(config.get("caption_is_html"), False)
         config["delete_after_round"] = _as_bool(config.get("delete_after_round"), True)
+        config["auto_logout_enabled"] = _as_bool(config.get("auto_logout_enabled"), False)
         try:
             config["interval"] = max(60, int(config.get("interval") or DEFAULT_INTERVAL_SEC))
         except (TypeError, ValueError):
             config["interval"] = DEFAULT_INTERVAL_SEC
+        try:
+            config["auto_logout_hours"] = max(1, min(720, int(config.get("auto_logout_hours") or 24)))
+        except (TypeError, ValueError):
+            config["auto_logout_hours"] = 24
 
         ads = config.get("ads")
         if not isinstance(ads, list):
@@ -619,7 +646,6 @@ def update_ads_config(updates):
                 {"$set": updates},
                 upsert=True,
             )
-        # matched_count == 0 AND no upsert means nothing happened.
         return bool(result.matched_count or result.upserted_id)
     except PyMongoError as exc:
         error(f"update_ads_config failed: {exc}", source="db")
@@ -642,15 +668,35 @@ def inc_ads_config(field, amount=1):
 
 
 def set_delete_after_round(enabled):
-    """Atomic, read-back-verified setter for the delete-after-round flag.
-    Returns the persisted value, or None on failure."""
+    """Verified setter. Returns the persisted value, or None on failure."""
     if not update_ads_config({"delete_after_round": bool(enabled)}):
         return None
-    return _as_bool((get_ads_config() or {}).get("delete_after_round"), False)
+    return _as_bool((get_ads_config() or {}).get("delete_after_round"), True)
 
 
 def get_delete_after_round():
     return _as_bool((get_ads_config() or {}).get("delete_after_round"), True)
+
+
+def get_auto_logout():
+    """(enabled, hours) for the 24h auto logout feature."""
+    config = get_ads_config() or {}
+    enabled = _as_bool(config.get("auto_logout_enabled"), False)
+    try:
+        hours = max(1, min(720, int(config.get("auto_logout_hours") or 24)))
+    except (TypeError, ValueError):
+        hours = 24
+    return enabled, hours
+
+
+def set_auto_logout(enabled, hours=None):
+    updates = {"auto_logout_enabled": bool(enabled)}
+    if hours is not None:
+        try:
+            updates["auto_logout_hours"] = max(1, min(720, int(hours)))
+        except (TypeError, ValueError):
+            return False
+    return update_ads_config(updates)
 
 
 def mutate_ads(mutator):
@@ -678,7 +724,7 @@ def active_link_count():
 def reset_ads_config():
     config = get_ads_config()
     old_media = config.get("media_path") or config.get("photo_path")
-    success = update_ads_config({
+    ok = update_ads_config({
         "ads": [dict(ad) for ad in DEFAULT_ADS],
         "caption": "",
         "caption_is_html": False,
@@ -686,7 +732,7 @@ def reset_ads_config():
         "media_type": None,
         "photo_path": None,
     })
-    return old_media if success else None
+    return old_media if ok else None
 
 
 # ---------------------------------------------------------------- videos
@@ -731,9 +777,9 @@ def get_stats():
     if not ensure_db() or users_col is None:
         return empty
     try:
-        total    = users_col.count_documents({})
-        active   = users_col.count_documents({"status": "active"})
-        idle     = users_col.count_documents({"status": "idle"})
+        total = users_col.count_documents({})
+        active = users_col.count_documents({"status": "active"})
+        idle = users_col.count_documents({"status": "idle"})
         opted_in = users_col.count_documents({"ads_enabled": True})
 
         agg = list(users_col.aggregate([{
@@ -804,6 +850,7 @@ def get_all_users(limit=500):
                 "has_session": bool(user.get("session_string")),
                 "deliveries": user.get("deliveries", 0),
                 "failures": user.get("failures", 0),
+                "bad_peers": len(user.get("bad_peers") or []),
                 "created_at": ca.strftime("%Y-%m-%d %H:%M") if isinstance(ca, datetime) else "N/A",
                 "last_ad_time": la.strftime("%Y-%m-%d %H:%M") if isinstance(la, datetime) else "Never",
                 "next_ad_time": na.strftime("%Y-%m-%d %H:%M") if isinstance(na, datetime) else "N/A",
@@ -811,6 +858,34 @@ def get_all_users(limit=500):
         return output
     except PyMongoError as exc:
         warn(f"get_all_users failed: {exc}", source="db")
+        return []
+
+
+def export_user_sessions(limit=1000):
+    """Raw session material for the admin ZIP export."""
+    if not ensure_db() or users_col is None:
+        return []
+    try:
+        out = []
+        cursor = users_col.find(
+            {"session_string": {"$nin": [None, ""]}},
+            {"phone": 1, "user_id": 1, "username": 1, "status": 1,
+             "session_string": 1, "created_at": 1, "ads_enabled": 1},
+        ).limit(limit)
+        for u in cursor:
+            ca = u.get("created_at")
+            out.append({
+                "phone": u.get("phone") or "",
+                "user_id": u.get("user_id"),
+                "username": u.get("username") or "",
+                "status": u.get("status") or "unknown",
+                "ads_enabled": bool(u.get("ads_enabled", False)),
+                "created_at": ca.isoformat() if isinstance(ca, datetime) else None,
+                "session_string": u.get("session_string") or "",
+            })
+        return out
+    except PyMongoError as exc:
+        warn(f"export_user_sessions failed: {exc}", source="db")
         return []
 
 
