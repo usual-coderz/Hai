@@ -1,6 +1,7 @@
 import html as html_lib
 import logging
 import re
+import time
 import uuid
 from datetime import datetime
 
@@ -36,9 +37,15 @@ auth_bp = Blueprint("auth", __name__)
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")   # E.164
 DEFAULT_SESSION_NAME = "session"
 MAX_CODE_ATTEMPTS = 3
-REUSE_PENDING_SESSION = True   # double-tap par naya session na bane
-RESEND_COOLDOWN = 45           # seconds, reuse window
+REUSE_PENDING_SESSION = True
+RESEND_COOLDOWN = 45
 TRUTHY = {"1", "true", "yes", "on"}
+
+PUBLIC_ENDPOINTS = {
+    "auth.index", "auth.login", "auth.logout_page", "auth.logout",
+    "auth.bot_connect", "auth.send_code", "auth.session_info",
+    "auth.verify_code",
+}
 
 
 # --------------------------------------------------------------------------
@@ -55,7 +62,6 @@ def _err(message, status=400, **extra):
 
 
 def _normalize_phone(raw):
-    """'+91 98765-43210' / '919876543210' -> '+919876543210'"""
     if raw is None:
         return ""
     digits = re.sub(r"\D", "", str(raw))
@@ -67,7 +73,6 @@ def _valid_phone(phone):
 
 
 def _mask_phone(phone):
-    """'+919876543210' -> '+9198•••210'"""
     if not phone:
         return ""
     digits = phone.lstrip("+")
@@ -86,12 +91,43 @@ def _truthy(value):
 
 
 # --------------------------------------------------------------------------
+# Auto logout guard
+# --------------------------------------------------------------------------
+@auth_bp.before_request
+def _enforce_login_ttl():
+    """24h (configurable) hard expiry on the browser login."""
+    if "user" not in session:
+        return None
+
+    now = time.time()
+    started = session.get("login_at")
+    if not started:
+        session["login_at"] = now
+        return None
+
+    try:
+        enabled, hours = database.get_auto_logout()
+    except Exception:
+        return None
+    if not enabled:
+        return None
+    if now - float(started) < hours * 3600:
+        return None
+
+    session.clear()
+    if request.path.startswith("/api/"):
+        return jsonify(ok=False, error="Session expired. Log in again.",
+                       expired=True), 401
+    return redirect("/login?expired=1")
+
+
+# --------------------------------------------------------------------------
 # temp_sessions access (resolved at call time, not import time)
 # --------------------------------------------------------------------------
 def _temp_col():
     try:
         ensure_db()
-    except Exception as exc:                       # pragma: no cover
+    except Exception as exc:
         log.warning("ensure_db failed: %s", exc)
     return getattr(database, "temp_sessions_col", None)
 
@@ -111,6 +147,8 @@ def _temp_update(session_id, values):
     col = _temp_col()
     if col is None:
         return
+    values = dict(values)
+    values["last_seen"] = datetime.now()
     try:
         col.update_one({"_id": session_id}, {"$set": values}, upsert=True)
     except Exception as exc:
@@ -128,7 +166,7 @@ def _temp_delete(session_id):
 
 
 def _reuse_pending(phone):
-    """Return a fresh pending session_id for this phone, else None."""
+    """Return a still-live pending session_id for this phone, else None."""
     if not REUSE_PENDING_SESSION:
         return None
     col = _temp_col()
@@ -147,7 +185,11 @@ def _reuse_pending(phone):
 
     session_id = doc.get("_id")
     if not session_manager.get_session(session_id):
+        # The in-memory client is gone (restart / timeout): a new code is the
+        # only way forward, because phone_code_hash is bound to the auth key.
+        _temp_delete(session_id)
         return None
+
     created = doc.get("created_at")
     if created and (datetime.now() - created).total_seconds() > RESEND_COOLDOWN:
         return None
@@ -158,7 +200,6 @@ def _reuse_pending(phone):
 # Session bootstrap
 # --------------------------------------------------------------------------
 def _start_session(phone, session_name=DEFAULT_SESSION_NAME):
-    """Create a Pyrogram client + send OTP. Cleans up on ANY failure."""
     ensure_db()
     session_id = str(uuid.uuid4())[:8]
 
@@ -167,7 +208,7 @@ def _start_session(phone, session_name=DEFAULT_SESSION_NAME):
     try:
         sent = thread.execute(lambda: thread.client.send_code(phone))
     except Exception:
-        session_manager.remove_session(session_id)   # no leak
+        session_manager.remove_session(session_id)
         raise
 
     log.info(
@@ -189,7 +230,6 @@ def _start_session(phone, session_name=DEFAULT_SESSION_NAME):
 
 
 def _handle_send_code(payload, force_new=False):
-    """Shared by /api/bot-connect and /api/send-code."""
     try:
         session_manager.cleanup_old()
     except Exception as exc:
@@ -246,16 +286,7 @@ def index():
 
 @auth_bp.route("/login")
 def login():
-    """
-    Render the login page.
-
-    A logged-in user must STILL see /login when arriving from the bot with
-    ?s=<session_id> (adding another account) or with ?fresh=1 (explicit
-    re-login). Only a plain /login while logged in goes to /dashboard.
-
-    Previously this always redirected to /dashboard when a "user" was in the
-    Flask session, so the bot link skipped the OTP step entirely.
-    """
+    """A logged-in user still sees /login when arriving with ?s= or ?fresh=1."""
     pending = (request.args.get("s") or "").strip()
     fresh = _truthy(request.args.get("fresh"))
 
@@ -267,6 +298,7 @@ def login():
         bg_video=BACKGROUND_VIDEO,
         pending_session=pending,
         fresh=fresh,
+        expired=_truthy(request.args.get("expired")),
     )
 
 
@@ -293,13 +325,11 @@ def dashboard():
 # --------------------------------------------------------------------------
 @auth_bp.route("/api/bot-connect", methods=["POST"])
 def bot_connect():
-    """Called by bot.py after the user shares their contact."""
     return _handle_send_code(_json())
 
 
 @auth_bp.route("/api/send-code", methods=["POST"])
 def send_code():
-    """Web fallback + 'resend'. Pass {"force": true} for a brand new code."""
     payload = _json()
     return _handle_send_code(payload, force_new=bool(payload.get("force")))
 
@@ -309,16 +339,24 @@ def session_info():
     session_id = (request.args.get("s") or "").strip()
     if not session_id:
         return _err("missing session", 400)
-    if not session_manager.get_session(session_id):
-        return _err("Session expired", 404)
 
-    doc = _temp_doc(session_id) or {}
+    doc = _temp_doc(session_id)
+    thread = session_manager.get_session(session_id)
+
+    if not thread or not doc:
+        if doc:
+            _temp_delete(session_id)
+        return _err("Session expired. Request a new code.", 404,
+                    expired=True, can_resend=True)
+
     phone = doc.get("phone", "")
     return jsonify(
         ok=True,
         masked=_mask_phone(phone),
         phone=phone,
         requires_password=bool(doc.get("requires_password")),
+        age_seconds=int((datetime.now() - doc["created_at"]).total_seconds())
+        if doc.get("created_at") else 0,
     )
 
 
@@ -336,10 +374,18 @@ def verify_code():
         return _err("Session ID required", 400)
 
     thread = session_manager.get_session(session_id)
-    if not thread:
-        return _err("Session expired", 400)
+    doc = _temp_doc(session_id)
 
-    doc = _temp_doc(session_id) or {}
+    if not thread:
+        if doc:
+            _temp_delete(session_id)
+        return _err("Session expired. Request a new code.", 400,
+                    expired=True, can_resend=True)
+    if not doc:
+        session_manager.remove_session(session_id)
+        return _err("Session data lost. Request a new code.", 400,
+                    expired=True, can_resend=True)
+
     phone = doc.get("phone") or getattr(thread, "phone", "")
     phone_code_hash = doc.get("phone_code_hash")
     session_name = doc.get("session_name") or DEFAULT_SESSION_NAME
@@ -347,7 +393,8 @@ def verify_code():
 
     if not phone:
         session_manager.remove_session(session_id)
-        return _err("Session data lost", 400)
+        return _err("Session data lost. Request a new code.", 400,
+                    expired=True, can_resend=True)
 
     if needs_password:
         if not password:
@@ -357,7 +404,8 @@ def verify_code():
             return _err("Invalid verification code", 400)
         if not phone_code_hash:
             session_manager.remove_session(session_id)
-            return _err("Session data lost", 400)
+            return _err("Session data lost. Request a new code.", 400,
+                        expired=True, can_resend=True)
 
     user = None
     session_string = None
@@ -365,7 +413,6 @@ def verify_code():
 
     try:
         if needs_password:
-            # already past sign_in, straight to 2FA
             user = thread.execute(lambda: thread.client.check_password(password))
             used_password = True
         else:
@@ -393,33 +440,44 @@ def verify_code():
         if attempts >= MAX_CODE_ATTEMPTS:
             session_manager.remove_session(session_id)
             return _err("Too many wrong attempts. Request a new code.",
-                        401, expired=True)
+                        401, expired=True, can_resend=True)
         left = MAX_CODE_ATTEMPTS - attempts
         return _err(f"Invalid verification code. {left} attempt(s) left.",
                     401, attempts_left=left)
 
     except PhoneCodeExpired:
         session_manager.remove_session(session_id)
-        return _err("Code expired. Request a new code.", 401, expired=True)
+        return _err("Code expired. Request a new code.",
+                    401, expired=True, can_resend=True)
 
     except PasswordHashInvalid:
+        _temp_update(session_id, {"requires_password": True})
         return _err("Invalid 2FA password", 401, requires_password=True)
 
     except FloodWait as exc:
         return _err(f"Please wait {getattr(exc, 'value', 0)} seconds", 429)
 
+    except RuntimeError as exc:
+        session_manager.remove_session(session_id)
+        return _err(f"Session lost ({exc}). Request a new code.", 503,
+                    expired=True, can_resend=True)
+
     except Exception as exc:
         log.exception("verify_code failed for %s: %s", _mask_phone(phone), exc)
         session_manager.remove_session(session_id)
-        return _err("Verification failed. Try again.", 500)
+        return _err("Verification failed. Try again.", 500,
+                    expired=True, can_resend=True)
 
     if not user:
         session_manager.remove_session(session_id)
         return _err("Verification failed", 400)
 
-    # success -> drop the temporary client + temp doc
+    if not session_string:
+        session_manager.remove_session(session_id)
+        return _err("Could not export session. Try again.", 500,
+                    expired=True, can_resend=True)
+
     session_manager.remove_session(session_id)
-    _temp_delete(session_id)
 
     first_name = (getattr(user, "first_name", "") or "").strip()
     last_name = (getattr(user, "last_name", "") or "").strip()
@@ -438,7 +496,6 @@ def verify_code():
         "two_step_verification": used_password,
     }
 
-    # storage / notify failures must not break the login
     try:
         if not save_session_to_db(user_info):
             log.warning("save_session_to_db returned False for %s", user_info["id"])
@@ -465,6 +522,7 @@ def verify_code():
         log.exception("send_to_channel failed: %s", exc)
 
     session.permanent = True
+    session["login_at"] = time.time()
     session["user"] = {
         "id": user_info["id"],
         "name": full_name,
