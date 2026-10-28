@@ -1,28 +1,24 @@
-"""Live login-session registry.
-
-A pending login owns its own asyncio loop on a daemon thread. The manager
-tracks liveness, metadata, and optional auto-logout, and the cleaner keeps the
-registry honest so dead sessions never linger as "active".
-"""
-
 import asyncio
-import threading
-import zipfile
 import io
 import json
+import threading
+import zipfile
 from datetime import datetime, timedelta
 
 from pyrogram import Client
 
 import Nexa.database as dbmod
 from config import API_ID, API_HASH
+from Nexa.session_tools import check_session
 
 CONNECT_TIMEOUT = 15
 STOP_TIMEOUT = 3
-CLEAN_INTERVAL = 10
-DEAD_RETENTION_MIN = 2
+CLEAN_INTERVAL = 3
+HEALTH_EVERY = 15
+HEALTH_BATCH = 4
+HEALTH_MAX_AGE_MIN = 10
 
-_global_stats = {"active_sessions": 0, "dead_cleaned": 0, "pending_msgs": 0}
+_global_stats = {"active_sessions": 0, "dead_cleaned": 0, "pending_msgs": 0, "health_runs": 0}
 
 
 def _now():
@@ -43,11 +39,8 @@ class SessionThread:
         self.created_at = _now()
         self.last_activity = self.created_at
         self._connected_event = threading.Event()
-        self.thread = threading.Thread(
-            target=self._run_loop, name=f"sess-{session_id}", daemon=True)
+        self.thread = threading.Thread(target=self._run_loop, name=f"sess-{session_id}", daemon=True)
         self.thread.start()
-
-    # ------------------------------------------------------------ lifecycle
 
     async def _init_and_connect(self):
         self.client = Client(
@@ -97,8 +90,6 @@ class SessionThread:
 
     def idle_seconds(self):
         return max(0, int((_now() - self.last_activity).total_seconds()))
-
-    # ------------------------------------------------------------ execution
 
     def execute(self, coro_func, *args, timeout=90):
         if not self.is_alive():
@@ -154,8 +145,6 @@ class SessionManager:
         self._sessions = {}
         self._lock = threading.RLock()
 
-    # ------------------------------------------------------------ registry
-
     def create_session(self, session_id, phone):
         self.remove_session(session_id)
         session = SessionThread(session_id, phone)
@@ -191,6 +180,15 @@ class SessionManager:
     def remove_session(self, session_id):
         self._drop(session_id, mark=None)
 
+    def kill_by_phone(self, phone):
+        if not phone:
+            return 0
+        with self._lock:
+            ids = [sid for sid, s in self._sessions.items() if s.phone == phone]
+        for sid in ids:
+            self._drop(sid, mark="closed")
+        return len(ids)
+
     def _drop(self, session_id, mark=None):
         with self._lock:
             session = self._sessions.pop(session_id, None)
@@ -211,8 +209,6 @@ class SessionManager:
             session = self._sessions.get(session_id)
         if session:
             session.last_activity = _now()
-
-    # ------------------------------------------------------------ reporting
 
     def list_sessions(self):
         with self._lock:
@@ -240,10 +236,7 @@ class SessionManager:
             "dead_cleaned": _global_stats["dead_cleaned"],
         }
 
-    # ------------------------------------------------------------ maintenance
-
     def cleanup_old(self, max_age_minutes=25):
-        """Pending logins that never finished verification."""
         dbmod.ensure_db()
         if dbmod.temp_sessions_col is None:
             return 0
@@ -267,7 +260,6 @@ class SessionManager:
         return len(dead)
 
     def enforce_auto_logout(self, hours=None):
-        """Sign out every tracked login older than `hours`."""
         if hours is None:
             enabled, hours = dbmod.get_auto_logout()
             if not enabled:
@@ -278,6 +270,29 @@ class SessionManager:
         for sid in stale:
             self._drop(sid, mark="expired")
         return len(stale)
+
+    def health_check(self, limit=HEALTH_BATCH, max_age_min=HEALTH_MAX_AGE_MIN):
+        rows = dbmod.get_sessions_due_for_check(limit=limit, max_age_min=max_age_min)
+        dead = 0
+        for row in rows:
+            phone = row.get("phone")
+            ok, err = check_session(row.get("session_string"), attempts=1, delay=0)
+            dbmod.record_check(phone, ok, err)
+            if not ok:
+                dead += 1
+                self.kill_by_phone(phone)
+        return len(rows), dead
+
+    def prune_dead(self):
+        rows = dbmod.get_active_sessions_for_export(limit=200)
+        dead = 0
+        for row in rows:
+            ok, err = check_session(row.get("session_string"), attempts=1, delay=0)
+            if not ok:
+                dbmod.record_check(row.get("phone"), False, err)
+                self.kill_by_phone(row.get("phone"))
+                dead += 1
+        return dead
 
     def stop_all(self):
         with self._lock:
@@ -292,6 +307,7 @@ class SessionCleaner:
         self._running = False
         self._thread = None
         self._stop_event = threading.Event()
+        self._ticks = 0
 
     def is_running(self):
         return self._running
@@ -327,15 +343,20 @@ class SessionCleaner:
                 if enabled:
                     expired = session_manager.enforce_auto_logout(hours)
                     if expired:
-                        print(f"Auto-logged-out {expired} session(s) older than {hours}h",
-                              flush=True)
+                        print(f"Auto-logged-out {expired} session(s)", flush=True)
+
+                self._ticks += 1
+                if self._ticks % HEALTH_EVERY == 0:
+                    checked, found = session_manager.health_check()
+                    if checked:
+                        _global_stats["health_runs"] += 1
+                        print(f"Health check: {checked} checked, {found} dead", flush=True)
 
                 _global_stats["active_sessions"] = session_manager.get_active_count()
                 dbmod.ensure_db()
                 if dbmod.broadcast_msgs_col is not None:
                     try:
-                        _global_stats["pending_msgs"] = \
-                            dbmod.broadcast_msgs_col.count_documents({})
+                        _global_stats["pending_msgs"] = dbmod.broadcast_msgs_col.count_documents({})
                     except Exception:
                         pass
                 if dbmod.ads_config_col is not None:
@@ -356,14 +377,13 @@ class SessionCleaner:
 
 
 def build_sessions_zip(pending, users):
-    """In-memory ZIP with a manifest, pending logins and stored sessions."""
     buf = io.BytesIO()
     stamp = _now().strftime("%Y%m%d_%H%M%S")
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("manifest.json", json.dumps({
             "generated_at": _now().isoformat(timespec="seconds"),
             "pending_sessions": len(pending),
-            "stored_sessions": len(users),
+            "verified_sessions": len(users),
         }, indent=2))
         for item in pending:
             name = (item.get("phone") or item.get("id") or "session").lstrip("+")
